@@ -494,4 +494,324 @@ function onSquareClick(e){
     if(move){
       makeMove(state.selected, move);
       state.selected = null; state.legal = [];
-      render(); updateStatus(); maybeAiTur
+      render(); updateStatus(); maybeAiTurn();
+      return;
+    }
+    if(p && p.color === state.turn){
+      state.selected = {r,c};
+      state.legal = legalMovesFor(state, r, c);
+      render();
+      return;
+    }
+    state.selected = null; state.legal = [];
+    render();
+    return;
+  }
+
+  if(p && p.color === state.turn){
+    state.selected = {r,c};
+    state.legal = legalMovesFor(state, r, c);
+    render();
+  }
+}
+
+function makeMove(from, move){
+  state.history.push(cloneState(state));
+  const p = state.board[from.r][from.c];
+  const {newBoard, captured} = applyMove(state.board, from, move, state.enPassant, state.castling);
+
+  if(captured){
+    state.captured[captured.color].push(captured.t);
+    playBeep(300);
+  } else {
+    playBeep(500);
+  }
+
+  if(p.t==='K'){
+    if(p.color==='w'){ state.castling.wK=false; state.castling.wQ=false; }
+    else { state.castling.bK=false; state.castling.bQ=false; }
+  }
+  if(p.t==='R'){
+    if(from.r===7 && from.c===0) state.castling.wQ=false;
+    if(from.r===7 && from.c===7) state.castling.wK=false;
+    if(from.r===0 && from.c===0) state.castling.bQ=false;
+    if(from.r===0 && from.c===7) state.castling.bK=false;
+  }
+
+  state.board = newBoard;
+  state.enPassant = (p.t==='P' && move.double) ? {r:(from.r+move.r)/2, c:from.c} : null;
+  state.turn = state.turn==='w' ? 'b' : 'w';
+}
+
+function resetGame(){
+  state = {
+    board: initialBoard(), turn:'w', selected:null, legal:[], history:[],
+    captured:{w:[],b:[]}, enPassant:null,
+    castling:{wK:true,wQ:true,bK:true,bQ:true}, over:false
+  };
+  render(); updateStatus();
+}
+
+// ---- AI opponent (stronger engine: PST evaluation + move ordering + quiescence search) ----
+let mode = 'ai';
+let aiColor = 'b';
+let difficulty = 'master'; // casual | skilled | master
+const DIFF_DEPTH = { casual:1, skilled:2, master:3 };
+
+const VALUES = {P:100,N:320,B:330,R:500,Q:900,K:0};
+
+// Simplified piece-square tables (from White's perspective; mirrored for Black)
+const PST = {
+  P:[0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10,
+     5,5,10,25,25,10,5,5, 0,0,0,20,20,0,0,0, 5,-5,-10,0,0,-10,-5,5,
+     5,10,10,-20,-20,10,10,5, 0,0,0,0,0,0,0,0],
+  N:[-50,-40,-30,-30,-30,-30,-40,-50, -40,-20,0,0,0,0,-20,-40,
+     -30,0,10,15,15,10,0,-30, -30,5,15,20,20,15,5,-30,
+     -30,0,15,20,20,15,0,-30, -30,5,10,15,15,10,5,-30,
+     -40,-20,0,5,5,0,-20,-40, -50,-40,-30,-30,-30,-30,-40,-50],
+  B:[-20,-10,-10,-10,-10,-10,-10,-20, -10,0,0,0,0,0,0,-10,
+     -10,0,5,10,10,5,0,-10, -10,5,5,10,10,5,5,-10,
+     -10,0,10,10,10,10,0,-10, -10,10,10,10,10,10,10,-10,
+     -10,5,0,0,0,0,5,-10, -20,-10,-10,-10,-10,-10,-10,-20],
+  R:[0,0,0,0,0,0,0,0, 5,10,10,10,10,10,10,5, -5,0,0,0,0,0,0,-5,
+     -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5,
+     -5,0,0,0,0,0,0,-5, 0,0,0,5,5,0,0,0],
+  Q:[-20,-10,-10,-5,-5,-10,-10,-20, -10,0,0,0,0,0,0,-10,
+     -10,0,5,5,5,5,0,-10, -5,0,5,5,5,5,0,-5, 0,0,5,5,5,5,0,-5,
+     -10,5,5,5,5,5,0,-10, -10,0,5,0,0,0,0,-10, -20,-10,-10,-5,-5,-10,-10,-20],
+  K:[-30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+     -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+     -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10,
+     20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20]
+};
+
+function pstValue(t, r, c, color){
+  const idx = color==='w' ? r*8+c : (7-r)*8+c;
+  return PST[t][idx];
+}
+
+function evaluateBoard(board){
+  let score = 0;
+  for(let r=0;r<8;r++) for(let c=0;c<8;c++){
+    const p = board[r][c];
+    if(!p) continue;
+    const val = VALUES[p.t] + pstValue(p.t, r, c, p.color);
+    score += (p.color==='w'?1:-1) * val;
+  }
+  return score;
+}
+
+function allLegalMoves(s, color){
+  const saved = s.turn; s.turn = color;
+  const out = [];
+  for(let r=0;r<8;r++) for(let c=0;c<8;c++){
+    const p = s.board[r][c];
+    if(p && p.color===color){
+      const lm = legalMovesFor(s, r, c);
+      for(const m of lm) out.push({from:{r,c}, move:m});
+    }
+  }
+  s.turn = saved;
+  return out;
+}
+
+function orderMoves(s, moves){
+  // MVV-LVA style ordering: captures of valuable pieces with cheap attackers first
+  return moves.slice().sort((a,b)=>{
+    const pa = s.board[a.from.r][a.from.c], pb = s.board[b.from.r][b.from.c];
+    const ta = s.board[a.move.r][a.move.c], tb = s.board[b.move.r][b.move.c];
+    const sa = ta ? (VALUES[ta.t] - VALUES[pa.t]/10) : -1;
+    const sb = tb ? (VALUES[tb.t] - VALUES[pb.t]/10) : -1;
+    return sb - sa;
+  });
+}
+
+function simulate(s, from, move){
+  const mover = s.board[from.r][from.c];
+  const {newBoard} = applyMove(s.board, from, move, s.enPassant, s.castling);
+  return {
+    board:newBoard,
+    turn: s.turn==='w'?'b':'w',
+    enPassant: (mover.t==='P' && move.double) ? {r:(from.r+move.r)/2,c:from.c} : null,
+    castling: Object.assign({}, s.castling)
+  };
+}
+
+function quiescence(s, alpha, beta, qdepth){
+  const standPat = evaluateBoard(s.board);
+  const maximizing = s.turn==='w';
+  if(qdepth<=0) return standPat;
+  if(maximizing){ if(standPat>=beta) return beta; if(standPat>alpha) alpha=standPat; }
+  else { if(standPat<=alpha) return alpha; if(standPat<beta) beta=standPat; }
+
+  const moves = allLegalMoves(s, s.turn).filter(m=>s.board[m.move.r][m.move.c]);
+  const ordered = orderMoves(s, moves);
+  for(const m of ordered){
+    const ns = simulate(s, m.from, m.move);
+    const val = quiescence(ns, alpha, beta, qdepth-1);
+    if(maximizing){ if(val>alpha) alpha=val; if(alpha>=beta) return beta; }
+    else { if(val<beta) beta=val; if(beta<=alpha) return alpha; }
+  }
+  return maximizing ? alpha : beta;
+}
+
+function minimax(s, depth, alpha, beta){
+  const maximizing = s.turn==='w';
+  const moves = allLegalMoves(s, s.turn);
+  if(moves.length===0){
+    const kp = findKing(s.board, s.turn);
+    const inCheck = kp && isSquareAttacked(s.board, kp[0], kp[1], s.turn==='w'?'b':'w');
+    if(!inCheck) return 0; // stalemate
+    return maximizing ? -9000-depth : 9000+depth;
+  }
+  if(depth===0) return quiescence(s, alpha, beta, 3);
+
+  const ordered = orderMoves(s, moves);
+  let best = maximizing ? -Infinity : Infinity;
+  for(const m of ordered){
+    const ns = simulate(s, m.from, m.move);
+    const val = minimax(ns, depth-1, alpha, beta);
+    if(maximizing){ if(val>best) best=val; if(val>alpha) alpha=val; }
+    else { if(val<best) best=val; if(val<beta) beta=val; }
+    if(beta<=alpha) break;
+  }
+  return best;
+}
+
+function pickAiMove(){
+  const moves = allLegalMoves(state, aiColor);
+  if(moves.length===0) return null;
+  const depth = DIFF_DEPTH[difficulty];
+  const maximizing = aiColor==='w';
+  const ordered = orderMoves(state, moves);
+  let bestVal = maximizing ? -Infinity : Infinity;
+  let bestMoves = [];
+  for(const m of ordered){
+    const ns = simulate(state, m.from, m.move);
+    const val = minimax(ns, depth-1, -Infinity, Infinity);
+    if(maximizing){
+      if(val>bestVal){ bestVal=val; bestMoves=[m]; } else if(val===bestVal) bestMoves.push(m);
+    } else {
+      if(val<bestVal){ bestVal=val; bestMoves=[m]; } else if(val===bestVal) bestMoves.push(m);
+    }
+  }
+  // Master plays the strongest line; easier levels keep a little variety
+  if(difficulty==='master') return bestMoves[0];
+  return bestMoves[Math.floor(Math.random()*bestMoves.length)];
+}
+
+function maybeAiTurn(){
+  if(mode!=='ai' || state.over || state.turn!==aiColor) return;
+  const thinkEl = document.getElementById('aiThinking');
+  if(thinkEl) thinkEl.classList.add('show');
+  setTimeout(()=>{
+    const best = pickAiMove();
+    if(thinkEl) thinkEl.classList.remove('show');
+    if(best){
+      makeMove(best.from, best.move);
+      render(); updateStatus();
+      maybeAiTurn();
+    }
+  }, 300);
+}
+
+const settings = { sound:true, theme:'classic' };
+const THEMES = {
+  classic: {light:'#eee0c4', dark:'#5c4330'},
+  ocean:   {light:'#dbe9f0', dark:'#3b6e8f'}
+};
+
+function applyTheme(){
+  const th = THEMES[settings.theme];
+  document.documentElement.style.setProperty('--light', th.light);
+  document.documentElement.style.setProperty('--dark', th.dark);
+}
+
+let audioCtx = null;
+function playBeep(freq){
+  if(!settings.sound) return;
+  try{
+    if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine'; osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.18);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.18);
+  }catch(e){}
+}
+
+document.getElementById('newBtn').addEventListener('click', ()=>{
+  resetGame();
+  maybeAiTurn();
+});
+
+document.getElementById('undoBtn').addEventListener('click', ()=>{
+  if(state.history.length===0) return;
+  let prev = state.history.pop();
+  if(mode==='ai' && state.history.length>0){
+    prev = state.history.pop();
+  }
+  state.board = prev.board; state.turn = prev.turn; state.captured = prev.captured;
+  state.enPassant = prev.enPassant; state.castling = prev.castling;
+  state.selected = null; state.legal = []; state.over = false;
+  render(); updateStatus();
+});
+
+document.getElementById('mode1p').addEventListener('click', (e)=>{
+  mode='ai';
+  e.currentTarget.classList.add('active');
+  document.getElementById('mode2p').classList.remove('active');
+});
+document.getElementById('mode2p').addEventListener('click', (e)=>{
+  mode='pvp';
+  e.currentTarget.classList.add('active');
+  document.getElementById('mode1p').classList.remove('active');
+});
+document.getElementById('aiColorBtn').addEventListener('click', (e)=>{
+  aiColor = aiColor==='b' ? 'w' : 'b';
+  e.currentTarget.textContent = aiColor==='b' ? 'Black' : 'White';
+});
+document.getElementById('diffBtn').addEventListener('click', (e)=>{
+  const order = ['casual','skilled','master'];
+  const labels = {casual:'Casual', skilled:'Skilled', master:'Master'};
+  const next = order[(order.indexOf(difficulty)+1) % order.length];
+  difficulty = next;
+  e.currentTarget.textContent = labels[next];
+});
+
+document.getElementById('settingsBtn').addEventListener('click', ()=>{
+  document.getElementById('settingsPanel').classList.toggle('open');
+});
+document.getElementById('soundSwitch').addEventListener('click', (e)=>{
+  settings.sound = !settings.sound;
+  e.currentTarget.classList.toggle('on', settings.sound);
+});
+document.getElementById('themeBtn').addEventListener('click', (e)=>{
+  settings.theme = settings.theme === 'classic' ? 'ocean' : 'classic';
+  e.currentTarget.textContent = settings.theme === 'classic' ? 'Classic' : 'Ocean';
+  applyTheme();
+});
+document.getElementById('startBtn').addEventListener('click', ()=>{
+  document.getElementById('introScreen').style.display = 'none';
+  document.getElementById('gameScreen').style.display = 'flex';
+  maybeAiTurn();
+});
+document.getElementById('gearBtn').addEventListener('click', ()=>{
+  document.getElementById('introScreen').style.display = 'flex';
+  document.getElementById('gameScreen').style.display = 'none';
+});
+document.getElementById('guideBtn').addEventListener('click', ()=>{
+  document.getElementById('guideScreen').classList.add('open');
+});
+document.getElementById('guideCloseBtn').addEventListener('click', ()=>{
+  document.getElementById('guideScreen').classList.remove('open');
+});
+
+applyTheme();
+render();
+updateStatus();
+</script>
+</body>
+</html>
